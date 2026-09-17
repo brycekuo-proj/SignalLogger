@@ -15,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -45,6 +46,7 @@ public class MainActivity extends Activity {
     private TextView samplesView;
     private TextView syncView;
     private TextView sensorView;
+    private TextView backgroundView;
     private TextView errorView;
     private EditText endpointEdit;
     private EditText tokenEdit;
@@ -65,6 +67,13 @@ public class MainActivity extends Activity {
         setContentView(buildUi());
         loadSettings();
         refreshHardwareProbe();
+        refreshBackgroundStatus();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshBackgroundStatus();
     }
 
     @Override
@@ -132,6 +141,13 @@ public class MainActivity extends Activity {
         syncView = text("Sync: NOT CONFIGURED\nPending: 0", 15, false);
         root.addView(syncView);
 
+        addSection(root, "BACKGROUND EXECUTION");
+        backgroundView = text("Checking…", 14, false);
+        root.addView(backgroundView);
+        Button background = button("ENABLE BACKGROUND MODE");
+        background.setOnClickListener(v -> requestBackgroundMode());
+        root.addView(background, fullWidth());
+
         addSection(root, "HARDWARE PROBE");
         sensorView = text("Checking…", 14, false);
         root.addView(sensorView);
@@ -155,16 +171,6 @@ public class MainActivity extends Activity {
         Button export = button("EXPORT LATEST SESSION DB");
         export.setOnClickListener(v -> exportDatabase());
         root.addView(export, fullWidth());
-
-        Button battery = button("OPEN BATTERY SETTINGS");
-        battery.setOnClickListener(v -> {
-            try {
-                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
-            } catch (Exception e) {
-                startActivity(new Intent(Settings.ACTION_SETTINGS));
-            }
-        });
-        root.addView(battery, fullWidth());
 
         startButton.setOnClickListener(v -> startLogger());
         stopButton.setOnClickListener(v -> stopLogger());
@@ -233,6 +239,41 @@ public class MainActivity extends Activity {
         stopButton.setEnabled(recording);
     }
 
+    private void refreshBackgroundStatus() {
+        if (backgroundView == null) return;
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        boolean unrestricted = Build.VERSION.SDK_INT < 23 || pm.isIgnoringBatteryOptimizations(getPackageName());
+        SharedPreferences p = getSharedPreferences(LoggerService.PREFS, MODE_PRIVATE);
+        boolean active = p.getBoolean(LoggerService.PREF_BACKGROUND_ACTIVE, false);
+        backgroundView.setText("Foreground service: ENABLED\n" +
+                "Screen-off CPU lock while recording: ENABLED\n" +
+                "Battery optimization exemption: " + (unrestricted ? "ENABLED" : "NOT ENABLED") + "\n" +
+                "Background session requested: " + (active ? "YES" : "NO"));
+    }
+
+    private void requestBackgroundMode() {
+        try {
+            if (Build.VERSION.SDK_INT >= 23) {
+                PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                    Intent request = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:" + getPackageName()));
+                    startActivity(request);
+                    return;
+                }
+            }
+            startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+        } catch (Exception e) {
+            try {
+                Intent details = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName()));
+                startActivity(details);
+            } catch (Exception ignored) {
+                Toast.makeText(this, "Open system battery settings and allow SignalLogger to run in background.", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
     private void refreshHardwareProbe() {
         SensorManager sm = (SensorManager) getSystemService(SENSOR_SERVICE);
         StringBuilder sb = new StringBuilder();
@@ -287,7 +328,7 @@ public class MainActivity extends Activity {
                 }
                 zip.closeEntry();
                 zip.putNextEntry(new ZipEntry("manifest.json"));
-                String manifest = "{\"format\":\"SignalLogger\",\"schemaVersion\":1,\"appVersion\":\"0.1.0\",\"latestSessionId\":\"" +
+                String manifest = "{\"format\":\"SignalLogger\",\"schemaVersion\":1,\"appVersion\":\"0.1.1\",\"latestSessionId\":\"" +
                         (latest == null ? "" : latest.replace("\"", "")) + "\"}";
                 zip.write(manifest.getBytes(StandardCharsets.UTF_8));
                 zip.closeEntry();

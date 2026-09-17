@@ -308,6 +308,22 @@ final class SignalDatabase extends SQLiteOpenHelper {
         }
     }
 
+    long sessionStartedAt(String sessionId) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT started_at_utc_ms FROM session WHERE session_id=? LIMIT 1",
+                new String[]{sessionId})) {
+            return c.moveToFirst() ? c.getLong(0) : 0L;
+        }
+    }
+
+    long maxSeq(String table, String sessionId) {
+        try (Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COALESCE(MAX(seq),0) FROM " + table + " WHERE session_id=?",
+                new String[]{sessionId})) {
+            return c.moveToFirst() ? c.getLong(0) : 0L;
+        }
+    }
+
     static final class Batch {
         final String table;
         final String streamType;

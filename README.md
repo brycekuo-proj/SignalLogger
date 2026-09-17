@@ -2,10 +2,11 @@
 
 Android-first research logger for the TaipeiSignal project. SignalLogger is not a navigation app and does not provide driving advice. It collects raw road/GNSS/sensor observations for later map-matching, multi-level-road and signal-phase calibration work.
 
-## v0.1.0 MVP
+## v0.1.1 MVP
 
 - Android 6+; primary first test device: OPPO A72 / Android 11.
 - Foreground location service so logging can continue with the screen off.
+- Background-recording mode uses a partial CPU wake lock while recording, requests battery-optimization exemption, and uses `START_STICKY` session recovery after system/vendor service kills.
 - GPS location samples with wall-clock and monotonic timestamps, accuracy, speed, bearing and altitude when available.
 - GNSS satellite quality snapshots on Android 7+.
 - Optional accelerometer, gyroscope, rotation-vector, magnetometer and barometer logging; missing sensors do not block recording.
@@ -14,7 +15,7 @@ Android-first research logger for the TaipeiSignal project. SignalLogger is not 
 - Manual `.signalzip` export containing the local SQLite database and manifest.
 - Minimal engineering UI only.
 
-Road name/direction/structure matching is intentionally not yet enabled in v0.1.0. The first road tests are intended to validate raw data quality before moving the matcher onto the phone.
+Road name/direction/structure matching is intentionally not yet enabled in v0.1.1. The first road tests are intended to validate raw data quality before moving the matcher onto the phone.
 
 ## Build
 

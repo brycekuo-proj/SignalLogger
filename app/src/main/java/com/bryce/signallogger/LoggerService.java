@@ -23,6 +23,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.SystemClock;
 
 import org.json.JSONArray;
@@ -45,6 +46,9 @@ public class LoggerService extends Service implements LocationListener, SensorEv
     public static final String PREFS = "signal_logger_prefs";
     public static final String PREF_ENDPOINT = "mcp_endpoint";
     public static final String PREF_TOKEN = "mcp_token";
+    public static final String PREF_BACKGROUND_ACTIVE = "background_recording_active";
+    public static final String PREF_ACTIVE_SESSION = "active_session_id";
+    public static final String PREF_ACTIVE_STARTED_MS = "active_started_at_ms";
 
     private static final String CHANNEL_ID = "signal_logger_recording";
     private static final int NOTIFICATION_ID = 4101;
@@ -56,6 +60,7 @@ public class LoggerService extends Service implements LocationListener, SensorEv
     private SignalDatabase db;
     private ScheduledExecutorService syncExecutor;
     private McpUploader uploader;
+    private PowerManager.WakeLock wakeLock;
 
     private final AtomicBoolean recording = new AtomicBoolean(false);
     private String sessionId;
@@ -89,21 +94,23 @@ public class LoggerService extends Service implements LocationListener, SensorEv
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) return START_NOT_STICKY;
-        String action = intent.getAction();
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             stopRecording("COMPLETED");
             stopSelf();
             return START_NOT_STICKY;
         }
-        if (ACTION_START.equals(action) && recording.compareAndSet(false, true)) {
-            startForeground(NOTIFICATION_ID, buildNotification("Starting…"));
-            worker.post(this::beginRecording);
+
+        boolean restartAfterSystemKill = intent == null && prefs.getBoolean(PREF_BACKGROUND_ACTIVE, false);
+        if ((ACTION_START.equals(action) || restartAfterSystemKill) && recording.compareAndSet(false, true)) {
+            startForeground(NOTIFICATION_ID, buildNotification(restartAfterSystemKill ? "Restoring background session…" : "Starting…"));
+            worker.post(() -> beginRecording(restartAfterSystemKill));
         }
-        return START_NOT_STICKY;
+        return recording.get() || prefs.getBoolean(PREF_BACKGROUND_ACTIVE, false) ? START_STICKY : START_NOT_STICKY;
     }
 
-    private void beginRecording() {
+    private void beginRecording(boolean resumeExistingSession) {
         try {
             if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
                 throw new SecurityException("Fine location permission not granted");
@@ -115,11 +122,30 @@ public class LoggerService extends Service implements LocationListener, SensorEv
                 installId = UUID.randomUUID().toString();
                 prefs.edit().putString("install_id", installId).apply();
             }
-            sessionId = newSessionId();
-            startedAtMs = System.currentTimeMillis();
-            db.startSession(sessionId, installId, startedAtMs, SystemClock.elapsedRealtimeNanos(),
-                    "0.1.0", sensorCapabilities());
 
+            if (resumeExistingSession) {
+                sessionId = prefs.getString(PREF_ACTIVE_SESSION, "");
+                if (sessionId == null || sessionId.isEmpty()) resumeExistingSession = false;
+            }
+
+            if (resumeExistingSession) {
+                startedAtMs = prefs.getLong(PREF_ACTIVE_STARTED_MS, db.sessionStartedAt(sessionId));
+                locationSeq = db.maxSeq("location_sample", sessionId);
+                gnssSeq = db.maxSeq("gnss_snapshot", sessionId);
+                sensorSeq = db.maxSeq("sensor_sample", sessionId);
+            } else {
+                sessionId = newSessionId();
+                startedAtMs = System.currentTimeMillis();
+                db.startSession(sessionId, installId, startedAtMs, SystemClock.elapsedRealtimeNanos(),
+                        "0.1.1", sensorCapabilities());
+                prefs.edit()
+                        .putBoolean(PREF_BACKGROUND_ACTIVE, true)
+                        .putString(PREF_ACTIVE_SESSION, sessionId)
+                        .putLong(PREF_ACTIVE_STARTED_MS, startedAtMs)
+                        .apply();
+            }
+
+            acquireWakeLock();
             locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, workerThread.getLooper());
             try {
                 if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
@@ -140,6 +166,8 @@ public class LoggerService extends Service implements LocationListener, SensorEv
         } catch (Exception e) {
             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             recording.set(false);
+            releaseWakeLock();
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_BACKGROUND_ACTIVE, false).apply();
             broadcastStatus();
             stopSelf();
         }
@@ -294,13 +322,45 @@ public class LoggerService extends Service implements LocationListener, SensorEv
             syncExecutor.shutdown();
             syncExecutor = null;
         }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putBoolean(PREF_BACKGROUND_ACTIVE, false)
+                .remove(PREF_ACTIVE_SESSION)
+                .remove(PREF_ACTIVE_STARTED_MS)
+                .apply();
+        releaseWakeLock();
         broadcastStatus();
         stopForeground(true);
     }
 
+    private void acquireWakeLock() {
+        if (wakeLock != null && wakeLock.isHeld()) return;
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SignalLogger::BackgroundRecording");
+        wakeLock.setReferenceCounted(false);
+        wakeLock.acquire();
+    }
+
+    private void releaseWakeLock() {
+        try {
+            if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        } catch (Exception ignored) {}
+        wakeLock = null;
+    }
+
     @Override
     public void onDestroy() {
-        if (recording.get()) stopRecording("INTERRUPTED");
+        if (recording.get()) {
+            // Preserve the active-session preference so START_STICKY can restore the same session
+            // after a system/vendor background kill. A user STOP clears the preference above.
+            try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+            try {
+                if (Build.VERSION.SDK_INT >= 24 && gnssCallback != null) locationManager.unregisterGnssStatusCallback(gnssCallback);
+            } catch (Exception ignored) {}
+            try { sensorManager.unregisterListener(this); } catch (Exception ignored) {}
+            if (syncExecutor != null) syncExecutor.shutdownNow();
+            releaseWakeLock();
+            recording.set(false);
+        }
         if (workerThread != null) workerThread.quitSafely();
         if (db != null) db.close();
         super.onDestroy();
