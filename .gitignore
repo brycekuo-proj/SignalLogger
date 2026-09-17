@@ -1,0 +1,20 @@
+# Gradle / Android
+.gradle/
+**/build/
+local.properties
+*.iml
+.idea/
+
+# macOS
+.DS_Store
+
+# Raw / private SignalLogger data
+data/received/*
+!data/received/.gitkeep
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.signalzip
+
+# Local release copies
+releases/*.apk
