@@ -76,6 +76,8 @@ public class LoggerService extends Service implements LocationListener, SensorEv
     private volatile int latestSatUsed = 0;
     private volatile String syncStatus = "NOT CONFIGURED";
     private volatile long syncPending = 0;
+    private volatile String syncAck = "GPS 0 · GNSS 0 · Sensor 0";
+    private volatile long syncLastSuccessMs = 0L;
     private volatile String lastError = "";
 
     private GnssStatus.Callback gnssCallback;
@@ -137,7 +139,7 @@ public class LoggerService extends Service implements LocationListener, SensorEv
                 sessionId = newSessionId();
                 startedAtMs = System.currentTimeMillis();
                 db.startSession(sessionId, installId, startedAtMs, SystemClock.elapsedRealtimeNanos(),
-                        "0.1.1", sensorCapabilities());
+                        "0.1.2", sensorCapabilities());
                 prefs.edit()
                         .putBoolean(PREF_BACKGROUND_ACTIVE, true)
                         .putString(PREF_ACTIVE_SESSION, sessionId)
@@ -267,8 +269,15 @@ public class LoggerService extends Service implements LocationListener, SensorEv
             McpUploader.SyncResult r = uploader.syncOnce(sessionId);
             syncStatus = r.status;
             syncPending = r.pending;
+            syncAck = r.ackSummary;
+            syncLastSuccessMs = r.lastSuccessAtMs;
+            if (r.online) {
+                if (lastError != null && lastError.startsWith("Sync: ")) lastError = "";
+            } else {
+                lastError = "Sync: " + r.error;
+            }
         } catch (Exception e) {
-            syncStatus = "OFFLINE";
+            syncStatus = "SYNC ERROR";
             lastError = "Sync: " + e.getMessage();
         }
     }
@@ -298,6 +307,8 @@ public class LoggerService extends Service implements LocationListener, SensorEv
         i.putExtra("sat_used", latestSatUsed);
         i.putExtra("sync_status", syncStatus);
         i.putExtra("sync_pending", syncPending);
+        i.putExtra("sync_ack", syncAck);
+        i.putExtra("sync_last_success_ms", syncLastSuccessMs);
         i.putExtra("last_error", lastError);
         sendBroadcast(i);
     }

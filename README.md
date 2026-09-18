@@ -2,7 +2,7 @@
 
 Android-first research logger for the TaipeiSignal project. SignalLogger is not a navigation app and does not provide driving advice. It collects raw road/GNSS/sensor observations for later map-matching, multi-level-road and signal-phase calibration work.
 
-## v0.1.1 MVP
+## v0.1.2 MVP
 
 - Android 6+; primary first test device: OPPO A72 / Android 11.
 - Foreground location service so logging can continue with the screen off.
@@ -12,6 +12,7 @@ Android-first research logger for the TaipeiSignal project. SignalLogger is not 
 - Optional accelerometer, gyroscope, rotation-vector, magnetometer and barometer logging; missing sensors do not block recording.
 - Local SQLite is always written first and remains the source of truth during network outages.
 - Realtime MCP `tools/call` batching to a configurable Mac endpoint, with sequence-based ACK and retry-safe/idempotent ingestion.
+- v0.1.2 adds server-state reconciliation (`signal.sync_status`), lost-ACK recovery, multi-batch catch-up, strict MCP result validation, and visible ACK/last-success diagnostics in the Android UI.
 - Manual `.signalzip` export containing the local SQLite database and manifest.
 - Minimal engineering UI only.
 

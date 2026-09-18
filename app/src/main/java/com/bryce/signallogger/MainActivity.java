@@ -138,7 +138,7 @@ public class MainActivity extends Activity {
         tokenEdit.setSingleLine(true);
         tokenEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
         root.addView(tokenEdit, fullWidth());
-        syncView = text("Sync: NOT CONFIGURED\nPending: 0", 15, false);
+        syncView = text("Sync: NOT CONFIGURED\nPending: 0\nACK: --\nLast success: --", 15, false);
         root.addView(syncView);
 
         addSection(root, "BACKGROUND EXECUTION");
@@ -232,7 +232,13 @@ public class MainActivity extends Activity {
         samplesView.setText("GPS: " + i.getLongExtra("location_samples", 0) +
                 "\nGNSS: " + i.getLongExtra("gnss_samples", 0) +
                 "\nSensor: " + i.getLongExtra("sensor_samples", 0));
-        syncView.setText("Sync: " + i.getStringExtra("sync_status") + "\nPending: " + i.getLongExtra("sync_pending", 0));
+        long lastSyncMs = i.getLongExtra("sync_last_success_ms", 0L);
+        String lastSync = lastSyncMs <= 0L ? "--" :
+                Math.max(0L, (System.currentTimeMillis() - lastSyncMs) / 1000L) + "s ago";
+        syncView.setText("Sync: " + i.getStringExtra("sync_status") +
+                "\nPending: " + i.getLongExtra("sync_pending", 0) +
+                "\nACK: " + valueOrDash(i.getStringExtra("sync_ack")) +
+                "\nLast success: " + lastSync);
         String err = i.getStringExtra("last_error");
         errorView.setText(err == null || err.isEmpty() ? "" : "Last error: " + err);
         startButton.setEnabled(!recording);
@@ -328,7 +334,8 @@ public class MainActivity extends Activity {
                 }
                 zip.closeEntry();
                 zip.putNextEntry(new ZipEntry("manifest.json"));
-                String manifest = "{\"format\":\"SignalLogger\",\"schemaVersion\":1,\"appVersion\":\"0.1.1\",\"latestSessionId\":\"" +
+                String manifest = "{\"format\":\"SignalLogger\",\"schemaVersion\":1,\"appVersion\":\"" +
+                        "0.1.2" + "\",\"latestSessionId\":\"" +
                         (latest == null ? "" : latest.replace("\"", "")) + "\"}";
                 zip.write(manifest.getBytes(StandardCharsets.UTF_8));
                 zip.closeEntry();

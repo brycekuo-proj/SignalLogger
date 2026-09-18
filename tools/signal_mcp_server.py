@@ -128,8 +128,29 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             request = json.loads(self.rfile.read(length) or b"{}")
             response = self.handle_mcp(request)
+            tool_name = ""
+            try:
+                if request.get("method") == "tools/call":
+                    tool_name = str((request.get("params") or {}).get("name") or "")
+                structured = ((response.get("result") or {}).get("structuredContent") or {})
+                if tool_name:
+                    print(
+                        "MCP_CALL"
+                        f" tool={tool_name}"
+                        f" ok={structured.get('ok')}"
+                        f" accepted={structured.get('accepted_through_seq')}"
+                        f" new_count={structured.get('new_count')}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
             self._json(200, response)
         except Exception as exc:
+            try:
+                tool_name = str(((request.get("params") or {}).get("name") or "")) if isinstance(request, dict) else ""
+            except Exception:
+                tool_name = ""
+            print(f"MCP_ERROR tool={tool_name} error={exc}", flush=True)
             req_id = None
             try:
                 req_id = request.get("id")
