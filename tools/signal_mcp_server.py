@@ -444,18 +444,41 @@ class HudModel:
         accuracy_m = max(5.0, float(accuracy_m or 20.0))
         limit = max(1, min(3, int(limit or 3)))
 
+        max_distance = 1800.0 if speed_mps >= 12.0 else 1200.0
+        max_angle = 32.0 if speed_mps >= 12.0 else 45.0
+        max_cross = max(55.0 if speed_mps >= 12.0 else 70.0, accuracy_m * 1.8)
+
+        # Preferred IDs come from the phone's previous corridor match. They are hints,
+        # not authority: after a turn, GPS jump, or stale stop-state they may no longer
+        # be in front of the vehicle. Revalidate and re-sort them against the current
+        # fix before returning any signal rows.
         preferred_ids = [str(x) for x in (preferred_ids or []) if str(x)]
         if preferred_ids:
-            items = []
+            preferred_candidates = []
             for icid in preferred_ids[:limit]:
                 s = self.intersections_by_id.get(icid)
                 if not s:
                     continue
-                estimate = self._estimate(icid, bearing_deg, now)
+                distance = self._distance_m(latitude, longitude, s["lat"], s["lon"])
+                if distance < 10.0 or distance > max_distance:
+                    continue
+                target_bearing = self._bearing_deg(latitude, longitude, s["lat"], s["lon"])
+                relative = self._angle_delta(bearing_deg, target_bearing)
+                rad = math.radians(relative)
+                along = distance * math.cos(rad)
+                cross = abs(distance * math.sin(rad))
+                if along <= 8.0 or abs(relative) > max_angle or cross > max_cross:
+                    continue
+                preferred_candidates.append((along, cross, distance, s))
+
+            preferred_candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+            items = []
+            for along, cross, distance, s in preferred_candidates[:limit]:
+                estimate = self._estimate(s["id"], bearing_deg, now)
                 item = {
-                    "intersection_id": icid,
+                    "intersection_id": s["id"],
                     "name": s["name"],
-                    "distance_m": round(self._distance_m(latitude, longitude, s["lat"], s["lon"]), 1),
+                    "distance_m": round(distance, 1),
                     "state": "UNKNOWN",
                     "remaining_s": None,
                 }
@@ -469,10 +492,6 @@ class HudModel:
                     "server_time_ms": int(time.time() * 1000),
                     "items": items,
                 }
-
-        max_distance = 1800.0 if speed_mps >= 12.0 else 1200.0
-        max_angle = 32.0 if speed_mps >= 12.0 else 45.0
-        max_cross = max(55.0 if speed_mps >= 12.0 else 70.0, accuracy_m * 1.8)
 
         candidates = []
         for s in self.intersections:

@@ -335,7 +335,7 @@ public class MainActivity extends Activity {
                 zip.closeEntry();
                 zip.putNextEntry(new ZipEntry("manifest.json"));
                 String manifest = "{\"format\":\"SignalLogger\",\"schemaVersion\":1,\"appVersion\":\"" +
-                        "0.1.2" + "\",\"latestSessionId\":\"" +
+                        "0.1.3" + "\",\"latestSessionId\":\"" +
                         (latest == null ? "" : latest.replace("\"", "")) + "\"}";
                 zip.write(manifest.getBytes(StandardCharsets.UTF_8));
                 zip.closeEntry();

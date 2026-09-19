@@ -139,7 +139,7 @@ public class LoggerService extends Service implements LocationListener, SensorEv
                 sessionId = newSessionId();
                 startedAtMs = System.currentTimeMillis();
                 db.startSession(sessionId, installId, startedAtMs, SystemClock.elapsedRealtimeNanos(),
-                        "0.1.2", sensorCapabilities());
+                        "0.1.3", sensorCapabilities());
                 prefs.edit()
                         .putBoolean(PREF_BACKGROUND_ACTIVE, true)
                         .putString(PREF_ACTIVE_SESSION, sessionId)
@@ -148,12 +148,11 @@ public class LoggerService extends Service implements LocationListener, SensorEv
             }
 
             acquireWakeLock();
-            locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, this, workerThread.getLooper());
-            try {
-                if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                    locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 2000L, 0f, this, workerThread.getLooper());
-                }
-            } catch (Exception ignored) {}
+            // Research data must stay GNSS-only. Mixing NETWORK_PROVIDER fixes into
+            // the same stream creates false jumps between parallel roads / elevated roads.
+            // 500 ms sampling also gives sub-second resolution for stop/release timing.
+            locationManager.requestLocationUpdates(
+                    LocationManager.GPS_PROVIDER, 500L, 0f, this, workerThread.getLooper());
 
             registerGnss();
             registerSensors();
@@ -230,7 +229,8 @@ public class LoggerService extends Service implements LocationListener, SensorEv
 
     @Override
     public void onLocationChanged(Location location) {
-        if (!recording.get() || sessionId == null) return;
+        if (!recording.get() || sessionId == null || location == null) return;
+        if (!LocationManager.GPS_PROVIDER.equals(location.getProvider())) return;
         try {
             locationSeq++;
             db.insertLocation(sessionId, locationSeq, location);
