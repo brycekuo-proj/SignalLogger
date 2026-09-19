@@ -82,7 +82,20 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"}
                 },
+                "fix_utc_ms": {"type": "integer"},
+                "request_utc_ms": {"type": "integer"},
             },
+        },
+    },
+    {
+        "name": "signal.consistency_events",
+        "description": "Read recent HUD-vs-OPPO motion conflict records for calibration.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer"},
+                "event_type": {"type": "string"}
+            }
         },
     },
 ]
@@ -125,6 +138,69 @@ def init_db(path: Path):
             """
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_raw_sample_time ON raw_sample(session_id, stream_type, seq)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_raw_sample_device_time ON raw_sample(stream_type, device_utc_ms)")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_consistency_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                time_bucket INTEGER NOT NULL,
+                first_seen_ms INTEGER NOT NULL,
+                last_seen_ms INTEGER NOT NULL,
+                sample_count INTEGER NOT NULL DEFAULT 1,
+                intersection_id TEXT NOT NULL,
+                intersection_name TEXT,
+                hud_state TEXT NOT NULL,
+                hud_remaining_s INTEGER,
+                a37_fix_utc_ms INTEGER,
+                a37_latitude REAL,
+                a37_longitude REAL,
+                a37_speed_mps REAL,
+                a37_bearing_deg REAL,
+                oppo_session_id TEXT,
+                oppo_seq INTEGER,
+                oppo_fix_utc_ms INTEGER,
+                oppo_latitude REAL,
+                oppo_longitude REAL,
+                oppo_speed_mps REAL,
+                oppo_bearing_deg REAL,
+                device_distance_m REAL,
+                oppo_intersection_distance_m REAL,
+                bearing_delta_deg REAL,
+                reason TEXT,
+                payload_json TEXT,
+                UNIQUE(event_type, intersection_id, time_bucket)
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_consistency_latest "
+            "ON signal_consistency_event(last_seen_ms DESC)"
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hud_observation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fix_utc_ms INTEGER NOT NULL,
+                server_received_ms INTEGER NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                speed_mps REAL,
+                bearing_deg REAL NOT NULL,
+                accuracy_m REAL,
+                intersection_id TEXT NOT NULL,
+                intersection_name TEXT,
+                hud_state TEXT NOT NULL,
+                hud_remaining_s INTEGER,
+                intersection_distance_m REAL,
+                UNIQUE(fix_utc_ms, intersection_id)
+            )
+            """
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_hud_observation_time "
+            "ON hud_observation(fix_utc_ms)"
+        )
 
 
 class HudModel:
@@ -401,6 +477,365 @@ class State:
         self.hud_token = hud_token
         self.hud_model = HudModel(hud_data_dir)
 
+    def hud_snapshot(self, args):
+        snapshot = self.hud_model.snapshot(
+            float(args["latitude"]),
+            float(args["longitude"]),
+            float(args["bearing_deg"]),
+            float(args.get("speed_mps", 0.0)),
+            float(args.get("accuracy_m", 20.0)),
+            int(args.get("limit", 3)),
+            args.get("intersection_ids") or [],
+        )
+        self.store_hud_observation(args, snapshot)
+        snapshot["oppo_comparison"] = self.compare_hud_with_oppo(args, snapshot)
+        return snapshot
+
+    def store_hud_observation(self, args, snapshot):
+        items = snapshot.get("items") or []
+        if not items:
+            return
+        primary = items[0]
+        icid = str(primary.get("intersection_id") or "")
+        if not icid:
+            return
+
+        now_ms = int(time.time() * 1000)
+        ref_ms = int(args.get("fix_utc_ms") or args.get("request_utc_ms") or now_ms)
+        with DB_LOCK, db_connection(self.db_path) as con:
+            con.execute(
+                """
+                INSERT INTO hud_observation(
+                    fix_utc_ms,server_received_ms,latitude,longitude,speed_mps,
+                    bearing_deg,accuracy_m,intersection_id,intersection_name,
+                    hud_state,hud_remaining_s,intersection_distance_m
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(fix_utc_ms,intersection_id) DO UPDATE SET
+                    server_received_ms=excluded.server_received_ms,
+                    latitude=excluded.latitude,
+                    longitude=excluded.longitude,
+                    speed_mps=excluded.speed_mps,
+                    bearing_deg=excluded.bearing_deg,
+                    accuracy_m=excluded.accuracy_m,
+                    intersection_name=excluded.intersection_name,
+                    hud_state=excluded.hud_state,
+                    hud_remaining_s=excluded.hud_remaining_s,
+                    intersection_distance_m=excluded.intersection_distance_m
+                """,
+                (
+                    ref_ms,
+                    now_ms,
+                    float(args["latitude"]),
+                    float(args["longitude"]),
+                    max(0.0, float(args.get("speed_mps", 0.0))),
+                    float(args["bearing_deg"]) % 360.0,
+                    max(5.0, float(args.get("accuracy_m", 20.0))),
+                    icid,
+                    primary.get("name"),
+                    primary.get("state") or "UNKNOWN",
+                    primary.get("remaining_s"),
+                    primary.get("distance_m"),
+                ),
+            )
+
+    def reconcile_oppo_location_batch(self, samples):
+        moving_times = []
+        for sample in samples or []:
+            try:
+                fix_ms = int(sample.get("fix_utc_ms") or sample.get("utc_ms") or 0)
+                speed = float(sample.get("speed_mps") or 0.0)
+                if fix_ms > 0 and speed >= 2.0:
+                    moving_times.append(fix_ms)
+            except Exception:
+                continue
+        if not moving_times:
+            return 0
+
+        start_ms = min(moving_times) - 4000
+        end_ms = max(moving_times) + 4000
+        with DB_LOCK, db_connection(self.db_path) as con:
+            rows = list(con.execute(
+                """
+                SELECT fix_utc_ms,latitude,longitude,speed_mps,bearing_deg,accuracy_m,
+                       intersection_id,intersection_name,hud_state,hud_remaining_s,
+                       intersection_distance_m
+                FROM hud_observation
+                WHERE fix_utc_ms BETWEEN ? AND ?
+                  AND hud_state='RED'
+                ORDER BY fix_utc_ms
+                """,
+                (start_ms, end_ms),
+            ))
+
+        # One check per 5-second/intersection bucket is enough; the event table
+        # itself also merges repeated evidence into that bucket.
+        selected = {}
+        for row in rows:
+            key = (row[6], int(row[0]) // 5000)
+            selected.setdefault(key, row)
+
+        recorded = 0
+        for row in selected.values():
+            args = {
+                "fix_utc_ms": int(row[0]),
+                "latitude": float(row[1]),
+                "longitude": float(row[2]),
+                "speed_mps": float(row[3] or 0.0),
+                "bearing_deg": float(row[4]),
+                "accuracy_m": float(row[5] or 20.0),
+            }
+            snapshot = {
+                "items": [{
+                    "intersection_id": row[6],
+                    "name": row[7],
+                    "state": row[8],
+                    "remaining_s": row[9],
+                    "distance_m": row[10],
+                }]
+            }
+            result = self.compare_hud_with_oppo(args, snapshot)
+            if result.get("recorded"):
+                recorded += 1
+        return recorded
+
+    def compare_hud_with_oppo(self, args, snapshot):
+        items = snapshot.get("items") or []
+        if not items:
+            return {"status": "NO_SIGNAL", "recorded": False}
+
+        primary = items[0]
+        icid = str(primary.get("intersection_id") or "")
+        intersection = self.hud_model.intersections_by_id.get(icid)
+        if not intersection:
+            return {"status": "NO_INTERSECTION", "recorded": False}
+
+        now_ms = int(time.time() * 1000)
+        ref_ms = int(args.get("fix_utc_ms") or args.get("request_utc_ms") or now_ms)
+        a37_lat = float(args["latitude"])
+        a37_lon = float(args["longitude"])
+        a37_bearing = float(args["bearing_deg"]) % 360.0
+        a37_speed = max(0.0, float(args.get("speed_mps", 0.0)))
+        a37_accuracy = max(5.0, float(args.get("accuracy_m", 20.0)))
+
+        with DB_LOCK, db_connection(self.db_path) as con:
+            rows = list(con.execute(
+                """
+                SELECT session_id, seq, payload_json, device_utc_ms
+                FROM raw_sample
+                WHERE stream_type='location'
+                  AND device_utc_ms BETWEEN ? AND ?
+                ORDER BY ABS(device_utc_ms - ?)
+                LIMIT 8
+                """,
+                (ref_ms - 4000, ref_ms + 4000, ref_ms),
+            ))
+
+        if not rows:
+            return {"status": "NO_OPPO_SAMPLE", "recorded": False}
+
+        valid = []
+        nearest = None
+        nearest_delta = None
+        for session_id, seq, payload_json, device_utc_ms in rows:
+            try:
+                p = json.loads(payload_json)
+                oppo_lat = float(p["latitude"])
+                oppo_lon = float(p["longitude"])
+                oppo_speed = max(0.0, float(p.get("speed_mps") or 0.0))
+                oppo_bearing = float(p.get("bearing_deg") or 0.0) % 360.0
+                oppo_accuracy = max(5.0, float(p.get("horizontal_accuracy_m") or 20.0))
+                device_distance = self.hud_model._distance_m(
+                    a37_lat, a37_lon, oppo_lat, oppo_lon
+                )
+                heading_delta = abs(self.hud_model._angle_delta(a37_bearing, oppo_bearing))
+                max_device_distance = max(
+                    35.0, min(70.0, a37_accuracy + oppo_accuracy + 15.0)
+                )
+                time_delta = abs(int(device_utc_ms or 0) - ref_ms)
+                sample = {
+                    "session_id": session_id,
+                    "seq": int(seq),
+                    "fix_utc_ms": int(device_utc_ms or 0),
+                    "latitude": oppo_lat,
+                    "longitude": oppo_lon,
+                    "speed_mps": oppo_speed,
+                    "bearing_deg": oppo_bearing,
+                    "accuracy_m": oppo_accuracy,
+                    "device_distance_m": device_distance,
+                    "bearing_delta_deg": heading_delta,
+                    "time_delta_ms": time_delta,
+                }
+                if nearest is None or time_delta < nearest_delta:
+                    nearest = sample
+                    nearest_delta = time_delta
+                if (
+                    time_delta <= 4000
+                    and oppo_accuracy <= 35.0
+                    and device_distance <= max_device_distance
+                    and (oppo_speed < 1.5 or heading_delta <= 35.0)
+                ):
+                    valid.append(sample)
+            except Exception:
+                continue
+
+        if not valid:
+            return {
+                "status": "OPPO_NOT_COLOCATED",
+                "recorded": False,
+                "nearest_time_delta_ms": nearest_delta,
+                "nearest_device_distance_m": round(nearest["device_distance_m"], 1) if nearest else None,
+            }
+
+        valid.sort(key=lambda s: s["fix_utc_ms"])
+        speeds = sorted(s["speed_mps"] for s in valid)
+        median_speed = speeds[len(speeds) // 2]
+        moving_samples = [s for s in valid if s["speed_mps"] >= 2.0]
+        best = min(valid, key=lambda s: s["time_delta_ms"])
+
+        oppo_intersection_distance = self.hud_model._distance_m(
+            best["latitude"], best["longitude"], intersection["lat"], intersection["lon"]
+        )
+        a37_intersection_distance = float(primary.get("distance_m") or 99999.0)
+        same_approach = (
+            best["bearing_delta_deg"] <= 35.0
+            and best["device_distance_m"] <= max(
+                35.0, min(70.0, a37_accuracy + best["accuracy_m"] + 15.0)
+            )
+        )
+        near_signal = (
+            a37_intersection_distance <= 55.0
+            and oppo_intersection_distance <= 55.0
+        )
+        sustained_moving = len(moving_samples) >= 2 and median_speed >= 2.0
+
+        comparison = {
+            "status": "NO_CONFLICT",
+            "recorded": False,
+            "oppo_session_id": best["session_id"],
+            "oppo_seq": best["seq"],
+            "time_delta_ms": best["time_delta_ms"],
+            "device_distance_m": round(best["device_distance_m"], 1),
+            "bearing_delta_deg": round(best["bearing_delta_deg"], 1),
+            "oppo_speed_mps": round(median_speed, 2),
+            "oppo_intersection_distance_m": round(oppo_intersection_distance, 1),
+        }
+
+        if (
+            primary.get("state") == "RED"
+            and primary.get("remaining_s") is not None
+            and same_approach
+            and near_signal
+            and sustained_moving
+        ):
+            event_type = "RED_WHILE_MOVING"
+            reason = (
+                "HUD predicted RED while colocated OPPO GPS showed sustained movement "
+                "near the same intersection/approach"
+            )
+            event_payload = {
+                "a37": {
+                    "fix_utc_ms": ref_ms,
+                    "latitude": a37_lat,
+                    "longitude": a37_lon,
+                    "speed_mps": a37_speed,
+                    "bearing_deg": a37_bearing,
+                    "accuracy_m": a37_accuracy,
+                },
+                "hud": primary,
+                "oppo": best,
+                "valid_oppo_sample_count": len(valid),
+                "moving_oppo_sample_count": len(moving_samples),
+                "median_oppo_speed_mps": median_speed,
+            }
+            bucket = ref_ms // 5000
+            with DB_LOCK, db_connection(self.db_path) as con:
+                con.execute(
+                    """
+                    INSERT INTO signal_consistency_event(
+                        event_type,time_bucket,first_seen_ms,last_seen_ms,sample_count,
+                        intersection_id,intersection_name,hud_state,hud_remaining_s,
+                        a37_fix_utc_ms,a37_latitude,a37_longitude,a37_speed_mps,a37_bearing_deg,
+                        oppo_session_id,oppo_seq,oppo_fix_utc_ms,oppo_latitude,oppo_longitude,
+                        oppo_speed_mps,oppo_bearing_deg,device_distance_m,
+                        oppo_intersection_distance_m,bearing_delta_deg,reason,payload_json
+                    ) VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(event_type,intersection_id,time_bucket) DO UPDATE SET
+                        last_seen_ms=excluded.last_seen_ms,
+                        sample_count=signal_consistency_event.sample_count+1,
+                        hud_remaining_s=excluded.hud_remaining_s,
+                        a37_fix_utc_ms=excluded.a37_fix_utc_ms,
+                        a37_latitude=excluded.a37_latitude,
+                        a37_longitude=excluded.a37_longitude,
+                        a37_speed_mps=excluded.a37_speed_mps,
+                        a37_bearing_deg=excluded.a37_bearing_deg,
+                        oppo_session_id=excluded.oppo_session_id,
+                        oppo_seq=excluded.oppo_seq,
+                        oppo_fix_utc_ms=excluded.oppo_fix_utc_ms,
+                        oppo_latitude=excluded.oppo_latitude,
+                        oppo_longitude=excluded.oppo_longitude,
+                        oppo_speed_mps=excluded.oppo_speed_mps,
+                        oppo_bearing_deg=excluded.oppo_bearing_deg,
+                        device_distance_m=excluded.device_distance_m,
+                        oppo_intersection_distance_m=excluded.oppo_intersection_distance_m,
+                        bearing_delta_deg=excluded.bearing_delta_deg,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        event_type, bucket, now_ms, now_ms,
+                        icid, primary.get("name"), primary.get("state"),
+                        int(primary.get("remaining_s") or 0),
+                        ref_ms, a37_lat, a37_lon, a37_speed, a37_bearing,
+                        best["session_id"], best["seq"], best["fix_utc_ms"],
+                        best["latitude"], best["longitude"], median_speed,
+                        best["bearing_deg"], best["device_distance_m"],
+                        oppo_intersection_distance, best["bearing_delta_deg"],
+                        reason,
+                        json.dumps(event_payload, separators=(",", ":"), ensure_ascii=False),
+                    ),
+                )
+            comparison["status"] = "CONFLICT_RECORDED"
+            comparison["recorded"] = True
+            comparison["event_type"] = event_type
+
+        return comparison
+
+    def consistency_events(self, limit=50, event_type=""):
+        limit = max(1, min(200, int(limit or 50)))
+        query = """
+            SELECT id,event_type,first_seen_ms,last_seen_ms,sample_count,
+                   intersection_id,intersection_name,hud_state,hud_remaining_s,
+                   oppo_speed_mps,device_distance_m,oppo_intersection_distance_m,
+                   bearing_delta_deg,reason
+            FROM signal_consistency_event
+        """
+        params = []
+        if event_type:
+            query += " WHERE event_type=?"
+            params.append(str(event_type))
+        query += " ORDER BY last_seen_ms DESC LIMIT ?"
+        params.append(limit)
+
+        events = []
+        with DB_LOCK, db_connection(self.db_path) as con:
+            for row in con.execute(query, params):
+                events.append({
+                    "id": row[0],
+                    "event_type": row[1],
+                    "first_seen_ms": row[2],
+                    "last_seen_ms": row[3],
+                    "sample_count": row[4],
+                    "intersection_id": row[5],
+                    "intersection_name": row[6],
+                    "hud_state": row[7],
+                    "hud_remaining_s": row[8],
+                    "oppo_speed_mps": row[9],
+                    "device_distance_m": row[10],
+                    "oppo_intersection_distance_m": row[11],
+                    "bearing_delta_deg": row[12],
+                    "reason": row[13],
+                })
+        return {"ok": True, "events": events, "count": len(events)}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "SignalLoggerMCP/0.1"
@@ -520,14 +955,11 @@ class Handler(BaseHTTPRequestHandler):
         if name == "signal.health":
             return {"ok": True, "server_time_ms": int(time.time() * 1000)}
         if name == "signal.hud_snapshot":
-            return self.server.state.hud_model.snapshot(
-                float(args["latitude"]),
-                float(args["longitude"]),
-                float(args["bearing_deg"]),
-                float(args.get("speed_mps", 0.0)),
-                float(args.get("accuracy_m", 20.0)),
-                int(args.get("limit", 3)),
-                args.get("intersection_ids") or [],
+            return self.server.state.hud_snapshot(args)
+        if name == "signal.consistency_events":
+            return self.server.state.consistency_events(
+                int(args.get("limit", 50)),
+                str(args.get("event_type") or ""),
             )
         if name == "signal.start_session":
             return self.start_session(args)
@@ -578,6 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
         now = int(time.time() * 1000)
         accepted = int(args.get("first_seq", 0)) - 1
         inserted = 0
+        new_samples = []
         with DB_LOCK, db_connection(self.server.state.db_path) as con:
             for sample in samples:
                 seq = int(sample["seq"])
@@ -588,12 +1021,18 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if cur.rowcount > 0:
                     inserted += 1
+                    new_samples.append(sample)
                 if seq > accepted:
                     accepted = seq
             con.execute(
                 "UPDATE ingest_session SET server_last_seen_ms=? WHERE session_id=?",
                 (now, session_id),
             )
+
+        consistency_recorded = 0
+        if stream_type == "location" and new_samples:
+            consistency_recorded = self.server.state.reconcile_oppo_location_batch(new_samples)
+
         return {
             "ok": True,
             "session_id": session_id,
@@ -601,6 +1040,7 @@ class Handler(BaseHTTPRequestHandler):
             "accepted_through_seq": accepted,
             "received_count": len(samples),
             "new_count": inserted,
+            "consistency_events_recorded": consistency_recorded,
             "server_time_ms": now,
         }
 

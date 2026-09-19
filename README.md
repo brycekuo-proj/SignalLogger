@@ -53,8 +53,11 @@ The receiver implements:
 - `signal.sync_status`
 - `signal.health`
 - `signal.hud_snapshot` — read-only realtime HUD snapshot for TaipeiSignalHUD using vehicle position, locked travel bearing and optional preferred intersection IDs.
+- `signal.consistency_events` — read recent HUD-vs-OPPO motion conflict records for signal calibration.
 
-The receiver supports a separate HUD-only bearer token. That token is scoped to `signal.health` and `signal.hud_snapshot` and cannot read raw logger sessions or call write/sync tools.
+The receiver supports a separate HUD-only bearer token. That token is scoped to `signal.health` and `signal.hud_snapshot` and cannot read raw logger sessions, consistency history, or call write/sync tools.
+
+For calibration, each primary A37 HUD result is stored as a short `hud_observation`. The receiver compares it against OPPO `location` samples using device timestamps, position, heading and distance to the same intersection. A `RED_WHILE_MOVING` event is recorded only when the phones are colocated, the approach direction agrees, both are within about 55 m of the same signal, and OPPO has sustained movement evidence. Events are merged into 5-second buckets. Because OPPO batches can arrive several seconds later, every new location batch also replays the matching A37 observations so delayed uploads are not missed.
 
 Raw received data is stored outside the repository by default. Do not commit raw GPS tracks.
 
