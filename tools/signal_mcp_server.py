@@ -201,6 +201,28 @@ def init_db(path: Path):
             "CREATE INDEX IF NOT EXISTS idx_hud_observation_time "
             "ON hud_observation(fix_utc_ms)"
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_timing_calibration (
+                intersection_id TEXT PRIMARY KEY,
+                phase_adjust_sec INTEGER NOT NULL,
+                source TEXT,
+                updated_at_ms INTEGER NOT NULL
+            )
+            """
+        )
+        con.execute(
+            """
+            INSERT INTO signal_timing_calibration(
+                intersection_id,phase_adjust_sec,source,updated_at_ms
+            ) VALUES('*',2,'field_report_fixed_2s_2026-09-19',?)
+            ON CONFLICT(intersection_id) DO UPDATE SET
+                phase_adjust_sec=excluded.phase_adjust_sec,
+                source=excluded.source,
+                updated_at_ms=excluded.updated_at_ms
+            """,
+            (int(time.time() * 1000),),
+        )
 
 
 class HudModel:
@@ -210,7 +232,23 @@ class HudModel:
         self.intersections_by_id = {}
         self.plans = {}
         self.schedules = {}
+        self.phase_adjustments = {}
         self.tz = ZoneInfo("Asia/Taipei")
+        self.xinsheng_exits = {
+            "N": [
+                {"lat": 25.048270, "intersection_id": "IKVJB", "label": "新生高架・長安出口"},
+                {"lat": 25.058025, "intersection_id": "IN5IU", "label": "新生高架・民生出口"},
+                {"lat": 25.076420, "intersection_id": "ISBID", "label": "新生高架・北安出口"},
+                {"lat": 25.079859, "intersection_id": "ISVI9", "label": "新生高架・通河出口"},
+            ],
+            "S": [
+                {"lat": 25.070747, "intersection_id": "IR8IP", "label": "新生高架・濱江出口"},
+                {"lat": 25.054901, "intersection_id": "IMFIU", "label": "新生高架・長春出口"},
+                {"lat": 25.048270, "intersection_id": "IKVJB", "label": "新生高架・長安出口"},
+                {"lat": 25.043123, "intersection_id": "IJSJD", "label": "新生高架・忠孝出口"},
+                {"lat": 25.040840, "intersection_id": "IJBJ9", "label": "新生高架・濟南出口"},
+            ],
+        }
         self._load()
 
     def _load(self):
@@ -364,7 +402,16 @@ class HudModel:
         if cycle <= 0 or selected_start >= cycle:
             return None
 
-        pos = (now.hour * 3600 + now.minute * 60 + now.second - plan["offset"]) % cycle
+        phase_adjust_sec = int(
+            self.phase_adjustments.get(icid, self.phase_adjustments.get("*", 0))
+        )
+        pos = (
+            now.hour * 3600
+            + now.minute * 60
+            + now.second
+            + phase_adjust_sec
+            - plan["offset"]
+        ) % cycle
         green_end = selected_start + selected["green"]
         yellow_end = green_end + selected["yellow"]
 
@@ -387,6 +434,7 @@ class HudModel:
             "remaining_s": int(remaining),
             "plan_id": plan_id,
             "phaseorder": plan["phaseorder"],
+            "phase_adjust_sec": phase_adjust_sec,
         }
 
     def snapshot(self, latitude, longitude, bearing_deg, speed_mps=0.0,
@@ -472,21 +520,148 @@ class HudModel:
 
 class State:
     def __init__(self, db_path: Path, token: str, hud_token: str, hud_data_dir: Path):
+        init_db(db_path)
         self.db_path = db_path
         self.token = token
         self.hud_token = hud_token
         self.hud_model = HudModel(hud_data_dir)
+        self.xinsheng_elevated_until_ms = 0
+        self.xinsheng_elevated_direction = ""
+        self._load_timing_calibration()
+
+    def _load_timing_calibration(self):
+        adjustments = {}
+        with DB_LOCK, db_connection(self.db_path) as con:
+            for intersection_id, adjust_sec in con.execute(
+                "SELECT intersection_id, phase_adjust_sec FROM signal_timing_calibration"
+            ):
+                adjustments[str(intersection_id)] = int(adjust_sec)
+        self.hud_model.phase_adjustments = adjustments
+
+    def _travel_direction(self, bearing_deg):
+        b = float(bearing_deg) % 360.0
+        if b <= 45.0 or b >= 315.0:
+            return "N"
+        if 135.0 <= b <= 225.0:
+            return "S"
+        return ""
+
+    def _recent_xinsheng_conflict_count(self, now_ms):
+        with DB_LOCK, db_connection(self.db_path) as con:
+            row = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM signal_consistency_event
+                WHERE event_type='RED_WHILE_MOVING'
+                  AND last_seen_ms >= ?
+                  AND (
+                    intersection_name LIKE '%新生北%'
+                    OR intersection_id IN ('IR8IP','IQEIV','IPLIV','IP6IV','IN5IU','IMFIU')
+                  )
+                  AND COALESCE(oppo_speed_mps,0) >= 10.0
+                """,
+                (now_ms - 45000,),
+            ).fetchone()
+        return int((row or [0])[0] or 0)
+
+    def _detect_xinsheng_elevated(self, args):
+        lat = float(args["latitude"])
+        lon = float(args["longitude"])
+        speed = max(0.0, float(args.get("speed_mps", 0.0)))
+        direction = self._travel_direction(args.get("bearing_deg", 0.0))
+        now_ms = int(time.time() * 1000)
+
+        in_corridor = (
+            25.0390 <= lat <= 25.0815
+            and 121.5220 <= lon <= 121.5348
+            and direction in {"N", "S"}
+        )
+        if not in_corridor:
+            return ""
+
+        strong_speed = speed >= 15.0
+        supported_speed = speed >= 10.0 and self._recent_xinsheng_conflict_count(now_ms) >= 1
+
+        if strong_speed or supported_speed:
+            self.xinsheng_elevated_until_ms = now_ms + 25000
+            self.xinsheng_elevated_direction = direction
+            return direction
+
+        if (
+            now_ms <= self.xinsheng_elevated_until_ms
+            and self.xinsheng_elevated_direction == direction
+        ):
+            return direction
+
+        return ""
+
+    def _xinsheng_ramp_snapshot(self, args, direction):
+        lat = float(args["latitude"])
+        lon = float(args["longitude"])
+        bearing = float(args["bearing_deg"])
+        now = datetime.now(self.hud_model.tz)
+
+        exits = self.hud_model.xinsheng_exits.get(direction, [])
+        target = None
+        if direction == "N":
+            for item in exits:
+                if item["lat"] > lat + 0.00020:
+                    target = item
+                    break
+        elif direction == "S":
+            for item in exits:
+                if item["lat"] < lat - 0.00020:
+                    target = item
+                    break
+
+        if target is None:
+            return None
+
+        icid = target["intersection_id"]
+        intersection = self.hud_model.intersections_by_id.get(icid)
+        if intersection is None:
+            return None
+
+        estimate = self.hud_model._estimate(icid, bearing, now)
+        item = {
+            "intersection_id": icid,
+            "name": target["label"],
+            "distance_m": round(
+                self.hud_model._distance_m(
+                    lat, lon, intersection["lat"], intersection["lon"]
+                ),
+                1,
+            ),
+            "state": "UNKNOWN",
+            "remaining_s": None,
+            "road_mode": "XINSHENG_ELEVATED",
+            "exit_name": target["label"],
+        }
+        if estimate:
+            item.update(estimate)
+
+        return {
+            "ok": True,
+            "source": "MCP_XINSHENG_ELEVATED",
+            "server_time_ms": int(time.time() * 1000),
+            "road_mode": "XINSHENG_ELEVATED",
+            "direction": direction,
+            "items": [item],
+        }
 
     def hud_snapshot(self, args):
-        snapshot = self.hud_model.snapshot(
-            float(args["latitude"]),
-            float(args["longitude"]),
-            float(args["bearing_deg"]),
-            float(args.get("speed_mps", 0.0)),
-            float(args.get("accuracy_m", 20.0)),
-            int(args.get("limit", 3)),
-            args.get("intersection_ids") or [],
-        )
+        direction = self._detect_xinsheng_elevated(args)
+        snapshot = self._xinsheng_ramp_snapshot(args, direction) if direction else None
+        if snapshot is None:
+            snapshot = self.hud_model.snapshot(
+                float(args["latitude"]),
+                float(args["longitude"]),
+                float(args["bearing_deg"]),
+                float(args.get("speed_mps", 0.0)),
+                float(args.get("accuracy_m", 20.0)),
+                int(args.get("limit", 3)),
+                args.get("intersection_ids") or [],
+            )
         self.store_hud_observation(args, snapshot)
         snapshot["oppo_comparison"] = self.compare_hud_with_oppo(args, snapshot)
         return snapshot

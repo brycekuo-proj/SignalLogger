@@ -57,6 +57,10 @@ The receiver implements:
 
 The receiver supports a separate HUD-only bearer token. That token is scoped to `signal.health` and `signal.hud_snapshot` and cannot read raw logger sessions, consistency history, or call write/sync tools.
 
+For calibration, each primary A37 HUD result is stored as a short `hud_observation`. The MCP receiver also carries the road-test timing calibration table (`signal_timing_calibration`), currently seeded with the field-confirmed +2 second phase adjustment. A per-intersection row overrides the `*` default.
+
+Xinsheng Elevated Road now has an explicit MCP road-mode rule. When the receiver detects a north/south high-speed trajectory in the Xinsheng corridor (or recent colocated red-while-moving evidence), it latches `XINSHENG_ELEVATED` and maps the vehicle to the next exit terminal instead of surface-road signals. Southbound targets: 濱江、長春、長安、忠孝、濟南. Northbound targets: 長安、民生、北安、通河. Unsupported terminal timing remains `UNKNOWN/--` rather than inventing a countdown.
+
 For calibration, each primary A37 HUD result is stored as a short `hud_observation`. The receiver compares it against OPPO `location` samples using device timestamps, position, heading and distance to the same intersection. A `RED_WHILE_MOVING` event is recorded only when the phones are colocated, the approach direction agrees, both are within about 55 m of the same signal, and OPPO has sustained movement evidence. Events are merged into 5-second buckets. Because OPPO batches can arrive several seconds later, every new location batch also replays the matching A37 observations so delayed uploads are not missed.
 
 Raw received data is stored outside the repository by default. Do not commit raw GPS tracks.
