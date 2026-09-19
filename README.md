@@ -52,6 +52,9 @@ The receiver implements:
 - `signal.end_session`
 - `signal.sync_status`
 - `signal.health`
+- `signal.hud_snapshot` — read-only realtime HUD snapshot for TaipeiSignalHUD using vehicle position, locked travel bearing and optional preferred intersection IDs.
+
+The receiver supports a separate HUD-only bearer token. That token is scoped to `signal.health` and `signal.hud_snapshot` and cannot read raw logger sessions or call write/sync tools.
 
 Raw received data is stored outside the repository by default. Do not commit raw GPS tracks.
 
