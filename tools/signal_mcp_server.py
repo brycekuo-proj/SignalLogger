@@ -1054,9 +1054,40 @@ class Handler(BaseHTTPRequestHandler):
             return "hud"
         return None
 
+    def _send_file(self, path, download_name):
+        file_path = Path(path)
+        if not file_path.is_file():
+            self._json(404, {"error": "file not found"})
+            return
+        size = file_path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.android.package-archive")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with file_path.open("rb") as src:
+            while True:
+                chunk = src.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def do_GET(self):
         if self.path == "/health":
             self._json(200, {"ok": True, "service": "SignalLoggerMCP", "time_ms": int(time.time() * 1000)})
+            return
+        if self.path == "/download/TaipeiSignalHUD.apk":
+            self._send_file(
+                "/Users/user/Bryce AI Studio/TaipeiSignalHUD/app/build/outputs/apk/debug/TaipeiSignalHUD-v0.0.9-roadtest-debug.apk",
+                "TaipeiSignalHUD-v0.0.9-roadtest-debug.apk",
+            )
+            return
+        if self.path == "/download/SignalLogger.apk":
+            self._send_file(
+                "/Users/user/Bryce AI Studio/SignalLogger/releases/SignalLogger-v0.1.3-debug.apk",
+                "SignalLogger-v0.1.3-debug.apk",
+            )
             return
         self._json(404, {"error": "not found"})
 
